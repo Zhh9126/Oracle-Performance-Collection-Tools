@@ -1,0 +1,558 @@
+#!/usr/bin/env python3
+import warnings
+warnings.filterwarnings("ignore", category=UserWarning)
+warnings.filterwarnings("ignore", category=DeprecationWarning)
+"""
+Oracle 性能诊断工具箱：AWR / ASH / SQL Trace 报告生成器
+
+【功能说明】
+1. AWR 报告 - 基于快照区间生成 HTML/文本报告。
+2. ASH 报告 - 基于时间范围生成活动会话历史报告。
+3. SQL Trace - 支持当前会话、指定会话、实例级跟踪，自动定位 trace 文件并提供 tkprof 使用指引。
+
+【环境依赖】
+- Python 3.6+
+- oracledb 模块：pip install oracledb
+"""
+
+import sys
+import os
+import re
+import getpass
+from datetime import datetime, timedelta
+
+try:
+    import oracledb
+except ImportError:
+    try:
+        import cx_Oracle as oracledb
+    except ImportError:
+        print("错误：未找到 oracledb 或 cx_Oracle 模块。")
+        print("请安装: pip install oracledb")
+        sys.exit(1)
+
+# ================= 配置区域 =================
+DEFAULT_USER = os.environ.get("ORACLE_USER", "system")
+DEFAULT_PASSWORD = os.environ.get("ORACLE_PASS", "")
+DEFAULT_HOST = os.environ.get("ORACLE_HOST", "localhost")
+DEFAULT_PORT = int(os.environ.get("ORACLE_PORT", "1521"))
+DEFAULT_SERVICE_NAME = os.environ.get("ORACLE_SERVICE", "orcl")
+DEFAULT_SID = os.environ.get("ORACLE_SID", "")
+OUTPUT_DIR = os.environ.get("ORACLE_REPORT_DIR", ".")
+# ============================================
+
+def print_header():
+    print("=" * 80)
+    print(" " * 20 + "Oracle 性能诊断工具箱 (AWR/ASH/SQL Trace)")
+    print("=" * 80)
+
+def get_oracle_env():
+    oracle_home = os.environ.get("ORACLE_HOME", "未设置")
+    oracle_sid = os.environ.get("ORACLE_SID", "未设置")
+    print("\n【环境检测】")
+    print(f"  ORACLE_HOME      : {oracle_home}")
+    print(f"  ORACLE_SID       : {oracle_sid}")
+    return oracle_home
+
+def get_connection_details():
+    print("\n--- 数据库连接配置 ---")
+    user = input(f"用户名 [{DEFAULT_USER}]: ") or DEFAULT_USER
+    password = getpass.getpass(f"{user} 的密码: ") or DEFAULT_PASSWORD
+    if DEFAULT_SID:
+        dsn_mode = input(f"使用 SID 连接？(y/n，默认 n，服务名为 {DEFAULT_SERVICE_NAME}): ").lower()
+        if dsn_mode == 'y':
+            dsn = f"{DEFAULT_HOST}:{DEFAULT_PORT}/{DEFAULT_SID}"
+        else:
+            dsn = oracledb.makedsn(DEFAULT_HOST, DEFAULT_PORT, service_name=DEFAULT_SERVICE_NAME)
+    else:
+        host = input(f"主机地址 [{DEFAULT_HOST}]: ") or DEFAULT_HOST
+        port = input(f"端口 [{DEFAULT_PORT}]: ") or str(DEFAULT_PORT)
+        service_name = input(f"服务名 [{DEFAULT_SERVICE_NAME}]: ") or DEFAULT_SERVICE_NAME
+        dsn = oracledb.makedsn(host, port, service_name=service_name)
+    return user, password, dsn
+
+def test_connection(user, password, dsn):
+    try:
+        connection = oracledb.connect(user=user, password=password, dsn=dsn)
+        print(f"✓ 成功连接到数据库 {dsn}")
+        return connection
+    except oracledb.Error as e:
+        error, = e.args
+        print(f"\n[致命错误] 连接数据库失败: {error.message}")
+        sys.exit(1)
+
+def fetch_snapshots(connection, hours=None):
+    cursor = connection.cursor()
+    time_filter = ""
+    if hours:
+        time_filter = f"WHERE BEGIN_INTERVAL_TIME >= SYSTIMESTAMP - INTERVAL '{hours}' HOUR"
+    sql = f"""
+        SELECT * FROM (
+            SELECT DBID, INSTANCE_NUMBER AS INST, SNAP_ID,
+                   TO_CHAR(BEGIN_INTERVAL_TIME, 'YYYY-MM-DD HH24:MI:SS') AS BEGIN_TIME,
+                   TO_CHAR(END_INTERVAL_TIME, 'YYYY-MM-DD HH24:MI:SS') AS END_TIME
+            FROM DBA_HIST_SNAPSHOT
+            {time_filter}
+            ORDER BY SNAP_ID DESC
+        ) WHERE ROWNUM <= 30
+        ORDER BY SNAP_ID ASC
+    """
+    cursor.execute(sql)
+    rows = cursor.fetchall()
+    if not rows:
+        print("错误：未找到任何快照。")
+        return None
+    print(f"\n{'DBID':<15} {'INST':<5} {'SNAP_ID':<10} {'BEGIN_TIME':<22} {'END_TIME':<22}")
+    print("-" * 80)
+    for row in rows:
+        print(f"{row[0]:<15} {row[1]:<5} {row[2]:<10} {row[3]:<22} {row[4]:<22}")
+    cursor.close()
+    return rows
+
+def check_instance_restart(connection, begin_snap, end_snap):
+    cursor = connection.cursor()
+    sql = """
+        SELECT COUNT(*)
+        FROM DBA_HIST_SNAPSHOT s1, DBA_HIST_SNAPSHOT s2, V$INSTANCE i
+        WHERE s1.SNAP_ID = :begin_snap AND s2.SNAP_ID = :end_snap
+          AND s1.INSTANCE_NUMBER = s2.INSTANCE_NUMBER AND s1.DBID = s2.DBID
+          AND i.INSTANCE_NUMBER = s1.INSTANCE_NUMBER
+          AND i.STARTUP_TIME > s1.BEGIN_INTERVAL_TIME
+          AND i.STARTUP_TIME < s2.END_INTERVAL_TIME
+    """
+    cursor.execute(sql, begin_snap=begin_snap, end_snap=end_snap)
+    count = cursor.fetchone()[0]
+    cursor.close()
+    return count > 0
+
+def parse_relative_time(rel_time_str):
+    match = re.match(r"(\d+)([mhd])", rel_time_str.strip().lower())
+    if not match:
+        return None
+    value = int(match.group(1))
+    unit = match.group(2)
+    if unit == 'm':
+        return timedelta(minutes=value)
+    elif unit == 'h':
+        return timedelta(hours=value)
+    elif unit == 'd':
+        return timedelta(days=value)
+    return None
+
+def generate_awr_report(connection, dbid, inst_num, begin_snap, end_snap, report_format='html'):
+    """
+    生成 AWR 报告，直接查询 TABLE 函数，兼容所有版本。
+    """
+    cursor = connection.cursor()
+    func_name = "AWR_REPORT_HTML" if report_format == 'html' else "AWR_REPORT_TEXT"
+    
+    sql = f"""
+        SELECT output
+        FROM TABLE(DBMS_WORKLOAD_REPOSITORY.{func_name}(
+            l_dbid => :dbid,
+            l_inst_num => :inst_num,
+            l_bid => :bid,
+            l_eid => :eid,
+            l_options => 0
+        ))
+    """
+    try:
+        cursor.execute(sql, dbid=dbid, inst_num=inst_num, bid=begin_snap, eid=end_snap)
+        lines = [str(row[0]) for row in cursor if row[0] is not None]
+        cursor.close()
+        return '\n'.join(lines)
+    except oracledb.DatabaseError as e:
+        error, = e.args
+        print(f"\n[错误] 生成 AWR 报告失败: {error.message}")
+        return None
+
+def generate_ash_report(connection, begin_time, end_time, report_format='html'):
+    """
+    生成 ASH 报告，兼容 11g, 12c, 19c。
+    参数顺序：l_dbid, l_inst_num, l_btime, l_etime, l_options
+    """
+    cursor = connection.cursor()
+    func_name = "ASH_REPORT_HTML" if report_format == 'html' else "ASH_REPORT_TEXT"
+
+    cursor.execute("SELECT DBID FROM V$DATABASE")
+    dbid = cursor.fetchone()[0]
+    cursor.execute("SELECT INSTANCE_NUMBER FROM V$INSTANCE")
+    inst_id = cursor.fetchone()[0]
+
+    sql = f"""
+        SELECT output
+        FROM TABLE(DBMS_WORKLOAD_REPOSITORY.{func_name}(
+            l_dbid      => :dbid,
+            l_inst_num  => :inst_id,
+            l_btime     => :begin_time,
+            l_etime     => :end_time,
+            l_options   => 0
+        ))
+    """
+    try:
+        cursor.execute(sql, dbid=dbid, inst_id=inst_id, begin_time=begin_time, end_time=end_time)
+        lines = [str(row[0]) for row in cursor if row[0] is not None]
+        cursor.close()
+        return '\n'.join(lines)
+    except oracledb.DatabaseError as e:
+        error, = e.args
+        print(f"\n[错误] 生成 ASH 报告失败: {error.message}")
+        print("提示：请确保 ASH 数据在指定时间范围内存在。")
+        return None
+
+def save_report(content, report_type, identifier, file_format='html'):
+    if not content:
+        print("错误：报告内容为空，无法保存。")
+        return None
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    filename = f"{report_type}_{identifier}_{timestamp}.{file_format}"
+    filepath = os.path.join(OUTPUT_DIR, filename)
+    try:
+        with open(filepath, 'w', encoding='utf-8') as f:
+            f.write(content)
+        print(f"\n✓ 报告已保存至: {filepath}")
+        return filepath
+    except IOError as e:
+        print(f"\n错误：写入文件失败 - {e}")
+        return None
+
+def get_trace_file_path(connection, sid=None):
+    """获取当前会话或指定 SID 的 trace 文件路径"""
+    cursor = connection.cursor()
+    try:
+        # 获取 trace 目录
+        cursor.execute("SELECT VALUE FROM V$DIAG_INFO WHERE NAME = 'Diag Trace'")
+        trace_dir = cursor.fetchone()[0]
+        
+        if sid is None:
+            cursor.execute("SELECT SID FROM V$MYSTAT WHERE ROWNUM = 1")
+            sid = cursor.fetchone()[0]
+        
+        # 获取实例名和进程信息
+        cursor.execute("SELECT INSTANCE_NAME FROM V$INSTANCE")
+        inst_name = cursor.fetchone()[0]
+        cursor.execute("""
+            SELECT p.SPID
+            FROM V$SESSION s, V$PROCESS p
+            WHERE s.PADDR = p.ADDR AND s.SID = :sid
+        """, sid=sid)
+        spid = cursor.fetchone()[0]
+        
+        trace_file = f"{trace_dir}/{inst_name}_ora_{spid}.trc"
+        return trace_file, trace_dir
+    except oracledb.Error as e:
+        print(f"获取 trace 文件路径失败: {e}")
+        return None, None
+    finally:
+        cursor.close()
+
+def sql_trace_menu(connection):
+    """增强型 SQL Trace 控制菜单"""
+    print("\n" + "=" * 60)
+    print("【SQL Trace 诊断工具】")
+    print("=" * 60)
+    print("SQL Trace 可详细记录 SQL 执行过程，帮助分析性能瓶颈。")
+    print("注意：跟踪会产生大量数据，分析完毕后请及时关闭。\n")
+    
+    print("请选择操作：")
+    print("1. 跟踪当前会话")
+    print("2. 跟踪指定会话（通过 SID 和 SERIAL#）")
+    print("3. 数据库实例级跟踪（⚠️ 谨慎使用）")
+    print("4. 查看当前 trace 文件位置")
+    print("5. tkprof 格式化工具使用说明")
+    print("6. 返回主菜单")
+    
+    choice = input("请输入选项: ").strip()
+    
+    if choice == '1':
+        # 当前会话跟踪
+        sub_menu = """
+1. 开启跟踪（使用 ALTER SESSION）
+2. 开启跟踪（使用 DBMS_SESSION）
+3. 关闭跟踪（两种方式均可）
+请选择: """
+        sub = input(sub_menu).strip()
+        cursor = connection.cursor()
+        try:
+            if sub == '1':
+                cursor.execute("ALTER SESSION SET SQL_TRACE = TRUE")
+                print("✓ 当前会话 SQL Trace 已开启（ALTER SESSION）")
+                # 可选设置标识符
+                ident = input("输入跟踪文件标识符（可选，回车跳过）: ").strip()
+                if ident:
+                    cursor.execute(f"ALTER SESSION SET TRACEFILE_IDENTIFIER = '{ident}'")
+                    print(f"  标识符已设置为: {ident}")
+            elif sub == '2':
+                cursor.execute("BEGIN DBMS_SESSION.SET_SQL_TRACE(sql_trace => TRUE); END;")
+                print("✓ 当前会话 SQL Trace 已开启（DBMS_SESSION）")
+            elif sub == '3':
+                cursor.execute("ALTER SESSION SET SQL_TRACE = FALSE")
+                print("✓ 当前会话 SQL Trace 已关闭")
+            else:
+                print("无效选项。")
+        except oracledb.Error as e:
+            print(f"操作失败: {e}")
+        finally:
+            cursor.close()
+            trace_file, _ = get_trace_file_path(connection)
+            if trace_file:
+                print(f"跟踪文件将生成在: {trace_file}")
+    
+    elif choice == '2':
+        # 跟踪指定会话
+        sid = input("请输入目标会话的 SID: ").strip()
+        serial = input("请输入目标会话的 SERIAL#: ").strip()
+        if not sid or not serial:
+            print("SID 和 SERIAL# 不能为空。")
+            return
+        
+        action = input("开启跟踪还是关闭跟踪？(start/stop): ").strip().lower()
+        enable = (action == 'start')
+        cursor = connection.cursor()
+        try:
+            # 使用 DBMS_SYSTEM.SET_SQL_TRACE_IN_SESSION（兼容 11g/19c）
+            cursor.execute("""
+                BEGIN
+                    DBMS_SYSTEM.SET_SQL_TRACE_IN_SESSION(
+                        sid => :sid,
+                        serial# => :serial,
+                        sql_trace => :enable
+                    );
+                END;
+            """, sid=int(sid), serial=int(serial), enable=enable)
+            status = "开启" if enable else "关闭"
+            print(f"✓ 已{status}会话 (SID={sid}, SERIAL#={serial}) 的 SQL Trace。")
+        except oracledb.Error as e:
+            error, = e.args
+            print(f"操作失败: {error.message}")
+            print("提示：可能需要 SYSDBA 权限或使用 DBMS_MONITOR.SESSION_TRACE_ENABLE 替代。")
+        finally:
+            cursor.close()
+            if enable:
+                trace_file, _ = get_trace_file_path(connection, sid=int(sid))
+                if trace_file:
+                    print(f"预计 trace 文件: {trace_file}")
+    
+    elif choice == '3':
+        # 实例级跟踪
+        print("\n⚠️  警告：实例级跟踪会记录所有会话的活动，严重影响性能！")
+        confirm = input("确定要继续吗？(yes/no): ").strip().lower()
+        if confirm != 'yes':
+            print("操作已取消。")
+            return
+        
+        instance_name = input("请输入实例名（默认当前实例，直接回车）: ").strip()
+        if not instance_name:
+            cursor = connection.cursor()
+            cursor.execute("SELECT INSTANCE_NAME FROM V$INSTANCE")
+            instance_name = cursor.fetchone()[0]
+            cursor.close()
+        
+        action = input("开启跟踪还是关闭跟踪？(start/stop): ").strip().lower()
+        enable = (action == 'start')
+        cursor = connection.cursor()
+        try:
+            if enable:
+                cursor.execute("""
+                    BEGIN
+                        DBMS_MONITOR.DATABASE_TRACE_ENABLE(
+                            INSTANCE_NAME => :inst_name,
+                            waits => TRUE,
+                            binds => TRUE
+                        );
+                    END;
+                """, inst_name=instance_name)
+                print(f"✓ 实例 '{instance_name}' 的数据库级跟踪已开启。")
+            else:
+                cursor.execute("""
+                    BEGIN
+                        DBMS_MONITOR.DATABASE_TRACE_DISABLE(
+                            INSTANCE_NAME => :inst_name
+                        );
+                    END;
+                """, inst_name=instance_name)
+                print(f"✓ 实例 '{instance_name}' 的数据库级跟踪已关闭。")
+        except oracledb.Error as e:
+            error, = e.args
+            print(f"操作失败: {error.message}")
+        finally:
+            cursor.close()
+    
+    elif choice == '4':
+        # 查看 trace 文件位置
+        trace_file, trace_dir = get_trace_file_path(connection)
+        if trace_file:
+            print(f"\n当前会话的跟踪文件预计位置:")
+            print(f"  目录: {trace_dir}")
+            print(f"  文件名: {os.path.basename(trace_file)}")
+            print(f"  完整路径: {trace_file}")
+            # 尝试列出最近 trace 文件
+            try:
+                files = [f for f in os.listdir(trace_dir) if f.endswith('.trc')]
+                if files:
+                    files.sort(key=lambda x: os.path.getmtime(os.path.join(trace_dir, x)), reverse=True)
+                    print("\n最近生成的 trace 文件:")
+                    for f in files[:5]:
+                        mtime = datetime.fromtimestamp(os.path.getmtime(os.path.join(trace_dir, f)))
+                        print(f"  {f}  ({mtime.strftime('%Y-%m-%d %H:%M:%S')})")
+            except Exception:
+                pass
+    
+    elif choice == '5':
+        # tkprof 说明
+        print("""
+【tkprof 格式化工具使用说明】
+
+tkprof 是 Oracle 提供的 trace 文件分析工具，可将二进制 .trc 文件转换为可读的报告。
+
+基本用法：
+    tkprof tracefile.trc output.txt [explain=user/password] [sys=no]
+
+常用选项：
+    explain=user/password   : 为 SQL 语句生成执行计划
+    sys=no                  : 跳过 SYS 用户的递归 SQL
+    sort=fchela             : 按 fetch 耗时排序
+
+示例：
+    cd /path/to/trace/dir
+    tkprof orcl_ora_12345.trc my_report.txt explain=system/manager sys=no
+
+执行后，用文本编辑器查看 my_report.txt 即可。
+        """)
+    
+    elif choice == '6':
+        return
+    else:
+        print("无效选项，返回主菜单。")
+
+def main():
+    print_header()
+    oracle_home = get_oracle_env()
+    
+    while True:
+        print("\n请选择功能：")
+        print("1. 生成 AWR 报告（基于快照）")
+        print("2. 生成 ASH 报告（基于时间范围）")
+        print("3. SQL Trace 辅助工具")
+        print("q. 退出")
+        choice = input("请输入选项: ").strip()
+        
+        if choice.lower() == 'q':
+            sys.exit(0)
+        elif choice not in ('1', '2', '3'):
+            print("无效选项，请重新选择。")
+            continue
+        
+        user, password, dsn = get_connection_details()
+        connection = test_connection(user, password, dsn)
+        
+        if choice == '1':
+            print("\n--- AWR 报告生成 ---")
+            hours_input = input("显示最近多少小时的快照？(直接回车显示全部): ").strip()
+            hours = int(hours_input) if hours_input.isdigit() else None
+            rows = fetch_snapshots(connection, hours)
+            if not rows:
+                connection.close()
+                continue
+            
+            while True:
+                begin_snap = input("\n请输入起始快照 ID: ").strip()
+                end_snap = input("请输入结束快照 ID: ").strip()
+                if not begin_snap or not end_snap:
+                    print("错误：必须提供快照 ID。")
+                    continue
+                if not (begin_snap.isdigit() and end_snap.isdigit()):
+                    print("错误：快照 ID 必须为数字。")
+                    continue
+                if int(end_snap) <= int(begin_snap):
+                    print("错误：结束快照 ID 必须大于起始快照 ID。")
+                    continue
+                snap_ids = [str(row[2]) for row in rows]
+                if begin_snap not in snap_ids or end_snap not in snap_ids:
+                    print("错误：快照 ID 不在显示的列表中。")
+                    continue
+                break
+            
+            if check_instance_restart(connection, begin_snap, end_snap):
+                print("\n" + "=" * 60)
+                print(f"警告：在快照 {begin_snap} 到 {end_snap} 之间数据库发生过重启。")
+                print("建议选择其他快照或使用 ASH 报告。")
+                print("=" * 60)
+                connection.close()
+                continue
+            
+            dbid = inst_num = None
+            for row in rows:
+                if str(row[2]) == begin_snap:
+                    dbid, inst_num = row[0], row[1]
+                    break
+            if not dbid:
+                print("错误：未找到对应 DBID。")
+                connection.close()
+                continue
+            
+            fmt_choice = input("报告格式 (html/text，默认 html): ").strip().lower()
+            report_format = 'text' if fmt_choice == 'text' else 'html'
+            
+            print("\n正在生成 AWR 报告...")
+            content = generate_awr_report(connection, dbid, inst_num, begin_snap, end_snap, report_format)
+            if content:
+                identifier = f"{begin_snap}_{end_snap}"
+                save_report(content, "awr", identifier, report_format)
+            else:
+                print("报告生成失败。")
+        
+        elif choice == '2':
+            print("\n--- ASH 报告生成 ---")
+            print("支持时间格式: YYYY-MM-DD HH24:MI:SS 或相对时间如 1h, 15m")
+            mode = input("选择输入方式 (1=绝对时间, 2=相对时间，默认1): ").strip() or '1'
+            if mode == '2':
+                rel_begin = input("相对开始时间 (例如 1h): ").strip()
+                rel_end = input("相对结束时间 (例如 0m 表示当前，直接回车=当前): ").strip()
+                delta_begin = parse_relative_time(rel_begin)
+                if not delta_begin:
+                    print("相对时间格式错误。")
+                    connection.close()
+                    continue
+                end_time = datetime.now()
+                begin_time = end_time - delta_begin
+                if rel_end:
+                    delta_end = parse_relative_time(rel_end)
+                    if delta_end:
+                        end_time = datetime.now() - delta_end
+                print(f"解析时间范围: {begin_time} 至 {end_time}")
+            else:
+                begin_str = input("起始时间 (YYYY-MM-DD HH24:MI:SS): ").strip()
+                end_str = input("结束时间 (YYYY-MM-DD HH24:MI:SS): ").strip()
+                try:
+                    begin_time = datetime.strptime(begin_str, '%Y-%m-%d %H:%M:%S')
+                    end_time = datetime.strptime(end_str, '%Y-%m-%d %H:%M:%S')
+                    if end_time <= begin_time:
+                        print("结束时间必须晚于起始时间。")
+                        connection.close()
+                        continue
+                except ValueError:
+                    print("时间格式错误。")
+                    connection.close()
+                    continue
+            
+            fmt_choice = input("报告格式 (html/text，默认 html): ").strip().lower()
+            report_format = 'text' if fmt_choice == 'text' else 'html'
+            
+            print("\n正在生成 ASH 报告...")
+            content = generate_ash_report(connection, begin_time, end_time, report_format)
+            if content:
+                identifier = f"{begin_time.strftime('%Y%m%d_%H%M%S')}_{end_time.strftime('%Y%m%d_%H%M%S')}"
+                save_report(content, "ash", identifier, report_format)
+            else:
+                print("ASH 报告生成失败。")
+        
+        elif choice == '3':
+            sql_trace_menu(connection)
+        
+        connection.close()
+        print("\n数据库连接已关闭。")
+
+if __name__ == "__main__":
+    main()
