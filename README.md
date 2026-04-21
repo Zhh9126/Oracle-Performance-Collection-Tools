@@ -167,6 +167,4 @@ DBID            INST  SNAP_ID    BEGIN_TIME             END_TIME
 ---
 
 **如果觉得这个工具有用，请给个 Star ⭐ 支持一下！**
-```
 
-这份 `README.md` 结构清晰、信息完整，既适合首次接触的用户快速上手，也涵盖了高级用户关心的版本兼容性和权限细节。你可以根据实际的 GitHub 仓库链接替换 `your-username` 部分。
